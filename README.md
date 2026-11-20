@@ -16,7 +16,11 @@ This project makes that scenario real, then proves the cleanup path is safe:
   every byte is in SQLite;
 * a new rotation is refused until the previous archive is cleaned up;
 * cleanup is a persisted, generation-bound operation that can be retried after
-  a crash but can never be pointed at another file.
+  a crash but can never be pointed at another file;
+* `POST /collect?reclaim=true` additionally gives the log **volume** its disk
+  back for bytes already committed to SQLite, by hole punching
+  (`FALLOC_FL_PUNCH_HOLE`) — file length and byte offsets are unchanged and the
+  writer keeps appending through its original handle.
 
 ## Layout
 
@@ -24,11 +28,13 @@ This project makes that scenario real, then proves the cleanup path is safe:
 app/                 collector + cleanup API (FastAPI)
   collector.py       restart-safe incremental reader
   identity.py        file identity with inode-reuse protection
-  service.py         rotate / drain / delete workflow
+  reclaim.py         hole-punch space reclamation behind the committed cursor
+  service.py         rotate / drain / delete / reclaim workflow
   main.py            HTTP API
   writer_api.py      thin writer proxy so everything is demoable in one Swagger
 writer_service/      local writer that owns the real file descriptor
-scripts/             demo_flow.py (happy path), restart_drill.sh (crash test)
+scripts/             demo_flow.py (happy path), reclaim_demo.py (disk reclaim),
+                     restart_drill.sh (crash test)
 tests/               pytest suite (file-level and HTTP-level)
 ```
 
@@ -66,6 +72,56 @@ The same flow from the shell:
 python -m scripts.demo_flow http://localhost:8000 http://localhost:8001
 ```
 
+## Reclaiming disk after collection (hole punching)
+
+Ingesting a line copies it into SQLite, but the original bytes still occupy
+blocks on the log volume. `POST /collect` takes an optional `reclaim` switch:
+
+```
+POST /collect?reclaim=true
+```
+
+After the normal ingestion transaction commits, the collector releases, on the
+**same original file**, the filesystem blocks that lie *completely before the
+committed cursor* using `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`:
+
+* **Length and offsets are unchanged.** Only mapped blocks are returned to the
+  volume; reads of a punched range return zeroes. The apparent file size stays
+  identical, so every stored `byte_offset` keeps meaning the same byte and the
+  writer's original `O_APPEND` handle keeps appending at the end.
+* **Only safe blocks are touched.** The block the cursor points into (which may
+  hold an un-ingested, half-written line) and everything after it stay
+  allocated. The punch boundary is block-aligned to the filesystem's fragment
+  size and can never pass the committed offset.
+* **Aimed at one inode.** The reclaimer opens the file itself and pins it to
+  the cursor's recorded `(device, inode)`. During a rotation the original inode
+  is followed onto its archive path; a path reused for another file is never
+  punched.
+* **Interleaving and restarts are safe.** The released boundary
+  (`punched_bytes`) is persisted in SQLite, only moves forward, and is updated
+  conditionally. Concurrent collections ingest exactly once and never
+  double-release; after a restart the boundary is simply resumed.
+* **No new logs? Still useful.** Calling `POST /collect?reclaim=true` again on
+  an active file reclaims blocks a previous attempt could not (for example once
+  a partial tail becomes a complete line). This also works after the collector
+  restarts.
+* **Failures are reported, not hidden.** If punching fails (unsupported
+  filesystem, read-only file, I/O error) the response stays `200`, ingestion is
+  untouched and every record remains queryable; the error appears in the
+  response's `reclaim` object and is persisted on the cursor (`GET /reclaim`),
+  and the next call retries automatically. On a filesystem without hole-punch
+  support the capability is remembered and the syscall is not retried.
+
+Watch the real footprint in Swagger (or shell): note `st_blocks`/allocated
+bytes before and after while the apparent size stays constant.
+
+```bash
+python -m scripts.reclaim_demo http://localhost:8000 http://localhost:8001
+```
+
+`GET /reclaim` reports the persisted boundary, last error, current size and
+allocated blocks for every cursor.
+
 ## Crash / restart drill
 
 ```bash
@@ -91,17 +147,22 @@ duplicates.
 | Cleanup retry is safe | Delete is an `operations` row bound to one generation with pinned `path/device/inode/expected_final_size`; it is re-verified right before `unlink`, and retries are idempotent if the file is already gone. |
 | Stale request cannot hit a later file | The request only references a generation; the inode/size check rejects a path that was replaced or grew; deleted generations short-circuit. |
 | Inode reuse cannot corrupt cursors | Identity registry allocates a new epoch when a retired `(device, inode)` reappears. |
+| Reclaim never changes visible data | `FALLOC_FL_KEEP_SIZE` keeps length/offsets; only blocks fully before the committed cursor are punched, so the cursor block and any partial tail stay allocated. |
+| Reclaim cannot mis-aim after rotation | The punch is pinned to the cursor's `(device, inode)` and the file is re-opened/verified first; the archived original is reached by identity, never by guessing a path. |
+| Reclaim is restart- and concurrency-safe | `punched_bytes` is persisted, advances only forward and is updated conditionally; concurrent collects and post-restart calls cannot double-release or go past the cursor. |
+| Reclaim failure is survivable | The error is returned in the response and persisted on the cursor; ingestion commits independently, records stay queryable, and the next `reclaim=true` call retries. |
 
 ## API
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/collect` | Read lines appended to the active file |
+| POST | `/collect?reclaim=true` | Read appended lines; optionally hole-punch collected blocks |
 | POST | `/rotation/rotate` | Rename active → archive (old handle stays open) |
 | POST | `/archives/{generation}/drain?close_handle=true` | Close old handle + ingest all remaining bytes |
 | POST | `/cleanup/delete` | Delete an archive generation (creates a retryable operation) |
 | POST | `/cleanup/retry?generation=&operation_id=` | Resume an interrupted/failed deletion |
 | GET | `/archives`, `/archives/{generation}` | Archive + operation status |
+| GET | `/reclaim` | Persisted hole-punch boundary, error and disk usage per cursor |
 | GET | `/entries?limit=&after_id=&generation=` | Ingested records |
 | GET | `/health` | Paths, DB, recovered operations |
 | GET/POST | `/writer/*` | Status, write, write-batch (proxy to the writer) |
@@ -113,16 +174,29 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-25 tests cover incremental/partial-tail reads, late appends after rename,
+40 tests cover incremental/partial-tail reads, late appends after rename,
 restart adoption, inode reuse, delete preconditions, path retargeting, growth
-after ingestion, interrupted-delete retry, and the HTTP surface.
+after ingestion, interrupted-delete retry, the HTTP surface, and space
+reclamation: real block release with unchanged length/offsets, partial-tail
+protection, no-op re-collection, identity pinning across rotation and inode
+replacement, parallel collections, read-only/unsupported/failure-and-retry
+paths, collector restart and the old-database schema migration.
 
 ## Known limitations
 
 * One source and one active file per deployment (`LOG_SOURCE_ID`); multiple
   sources would need per-source writer routing.
 * `collect` is pull-based (no background tailer). Docker Compose does not
-  schedule it; call `POST /collect` or add a cron/worker.
+  schedule it; call `POST /collect` (with `reclaim=true` when wanted) or add a
+  cron/worker.
+* Hole punching requires a Linux filesystem supporting `FALLOC_FL_PUNCH_HOLE`
+  (ext4, XFS, Btrfs, overlayfs backed by one of these, tmpfs, …). On an
+  unsupported object the first attempt records the `EOPNOTSUPP`/`EINVAL` error
+  and the capability is switched off for that cursor rather than retried.
+  Reclaim needs a writable descriptor; a read-only file reports a reclaim
+  error but never blocks ingestion.
+* Reclaim is driven through `/collect`; an archive that is rotated away and
+  never collected again is still removed wholesale by `POST /cleanup/delete`.
 * The writer is an in-memory descriptor process: `docker compose restart writer`
   loses its handle state. The collector handles that (the archive is adopted and
   drained), but the writer will resume appending to its configured active path.

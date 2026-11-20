@@ -68,6 +68,14 @@ CREATE TABLE IF NOT EXISTS cursors (
     path            TEXT,
     offset_bytes    INTEGER NOT NULL DEFAULT 0,
     line_number     INTEGER NOT NULL DEFAULT 0,
+    -- Hole-punching bookkeeping (see app/reclaim.py).  ``punched_bytes`` is the
+    -- exclusive end offset of the range already released back to the volume;
+    -- it can only advance and can never overtake ``offset_bytes``.  A non-NULL
+    -- ``punch_last_error`` records the most recent failed reclaim attempt so a
+    -- failure is still visible after a process restart.
+    punched_bytes   INTEGER NOT NULL DEFAULT 0,
+    punch_supported INTEGER NOT NULL DEFAULT 1,
+    punch_last_error TEXT,
     updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
@@ -128,6 +136,22 @@ class Database:
     def initialize(self) -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            self._migrate_cursor_reclaim_columns(conn)
+
+    @staticmethod
+    def _migrate_cursor_reclaim_columns(conn: sqlite3.Connection) -> None:
+        """Add hole-punch columns to databases created before this feature."""
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(cursors)")}
+        if "punched_bytes" not in existing:
+            conn.execute(
+                "ALTER TABLE cursors ADD COLUMN punched_bytes INTEGER NOT NULL DEFAULT 0"
+            )
+        if "punch_supported" not in existing:
+            conn.execute(
+                "ALTER TABLE cursors ADD COLUMN punch_supported INTEGER NOT NULL DEFAULT 1"
+            )
+        if "punch_last_error" not in existing:
+            conn.execute("ALTER TABLE cursors ADD COLUMN punch_last_error TEXT")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

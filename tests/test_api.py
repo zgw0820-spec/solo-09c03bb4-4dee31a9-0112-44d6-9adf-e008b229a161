@@ -132,7 +132,22 @@ def test_openapi_documents_the_workflow(client):
         "/cleanup/retry",
         "/entries",
         "/archives",
+        "/reclaim",
     ):
         assert path in paths, path
+    # The optional reclaim switch is documented as a boolean query parameter.
+    collect_params = {
+        p["name"]: p for p in paths["/collect"]["post"].get("parameters", [])
+    }
+    assert "reclaim" in collect_params
+    assert collect_params["reclaim"]["in"] == "query"
+    assert collect_params["reclaim"]["schema"]["default"] is False
     tags = {tag for path in paths.values() for op in path.values() for tag in op.get("tags", [])}
     assert {"collection", "rotation", "cleanup", "inspection"} <= tags
+
+
+def test_collect_without_reclaim_has_no_reclaim_section(client):
+    api, writer, _settings, _service = client
+    writer.append("plain")
+    body = api.post("/collect").json()
+    assert "reclaim" not in body

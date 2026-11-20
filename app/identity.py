@@ -22,6 +22,22 @@ class IdentityRegistry:
     def make_key(source_id: str, device: int, inode: int, epoch: int) -> str:
         return f"{source_id}:{device}:{inode}:{epoch}"
 
+    @staticmethod
+    def make_key_parts(file_key: str) -> tuple[int, int] | None:
+        """Parse ``(device, inode)`` back out of a file key.
+
+        The source id may itself contain ``:``, so the identity is taken from
+        the last three ``:``-separated fields.  Returns ``None`` for a key that
+        was not produced by :meth:`make_key`.
+        """
+        parts = str(file_key).rsplit(":", 3)
+        if len(parts) != 4:
+            return None
+        try:
+            return int(parts[1]), int(parts[2])
+        except ValueError:
+            return None
+
     def resolve(
         self, conn: sqlite3.Connection, source_id: str, device: int, inode: int
     ) -> str:

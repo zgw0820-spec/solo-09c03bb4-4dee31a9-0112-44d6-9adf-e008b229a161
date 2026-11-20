@@ -15,6 +15,12 @@ Invariants
    what makes "clean up the previous one before starting the next round" true.
 5. Deletes are idempotent when the file is already gone, so an interrupted
    cleanup can simply be retried.
+6. Optional space reclamation (``POST /collect?reclaim=true``) punches holes
+   only into the *original* file of the current collection, only over
+   filesystem blocks fully before the SQLite-committed cursor, never changes
+   the file's length or offsets, and persists its own advancing boundary so
+   interleaved calls, rotations and restarts cannot double-release or mis-aim
+   it.  Reclaim failures never roll ingestion back.
 """
 
 from __future__ import annotations
@@ -32,6 +38,7 @@ from .collector import (
 from .config import Settings
 from .db import Database
 from .identity import IdentityRegistry
+from .reclaim import SpaceReclaimer
 from .writer_client import WriterClient
 
 
@@ -48,6 +55,7 @@ class RotationService:
         self.writer = writer
         self.identities = IdentityRegistry(db)
         self.collector = Collector(db, self.identities, settings.max_batch_bytes)
+        self.reclaimer = SpaceReclaimer(db)
 
     # ---------------------------------------------------------------- setup
 
@@ -215,12 +223,25 @@ class RotationService:
 
     # -------------------------------------------------------------- collect
 
-    def collect_active(self) -> dict:
+    def collect_active(self, *, reclaim: bool = False) -> dict:
+        """Collect newly appended bytes of the active log, then optionally
+        release the blocks of already-collected bytes by hole punching.
+
+        Reclaim is best-effort and fully decoupled from ingestion: the cursor
+        commit happens first, and a punch failure is reported on the response
+        (and persisted on the cursor row) while every ingested record remains
+        queryable.  A collection with no new logs is still useful: with
+        ``reclaim=True`` it catches up on blocks a previous call could not
+        release, which also works after a process restart.
+        """
         path = self.settings.active_path
         if not path.exists():
             # Between a rename and the explicit close-old-handle there is no
-            # active file yet.  That is not an error; report it plainly.
-            return {
+            # active file yet.  That is not an error; report it plainly.  A
+            # reclaim request can still target the rotated original file via
+            # its persisted cursor/identity, so late-appended-and-collected
+            # blocks are not stranded just because the active path is absent.
+            response = {
                 "file_key": None,
                 "offset_before": 0,
                 "offset_after": 0,
@@ -232,13 +253,16 @@ class RotationService:
                 "hint": "writer has not switched to a new file yet; call "
                 "/archives/{generation}/drain",
             }
+            if reclaim:
+                response["reclaim"] = self._reclaim_active_file(collect_result=None)
+            return response
         try:
             result = self.collector.ingest_file(self.settings.source_id, path)
         except FileShrankError as exc:
             raise WorkflowError(str(exc), 409) from exc
         except LineTooLongError as exc:
             raise WorkflowError(str(exc), 422) from exc
-        return {
+        response = {
             "file_key": result.file_key,
             "offset_before": result.offset_before,
             "offset_after": result.offset_after,
@@ -248,6 +272,77 @@ class RotationService:
             "complete": result.complete,
             "active_file_exists": True,
         }
+        if reclaim:
+            response["reclaim"] = self._reclaim_active_file(collect_result=result)
+        return response
+
+    def _reclaim_active_file(self, *, collect_result) -> dict:
+        """Reclaim blocks of *this collection's original* active file only.
+
+        The file key and identity come from the just-finished ingestion (or,
+        when no active file exists, from the latest live cursor), never from a
+        path guess.  During a rotation the original inode keeps living under
+        its archive name; registered archive paths for the same identity are
+        therefore included as candidates.  Identity pinning inside the
+        reclaimer guarantees the punch lands on that inode and no other.
+        """
+        if collect_result is not None:
+            file_key = collect_result.file_key
+            expected_identity = IdentityRegistry.make_key_parts(file_key)
+        else:
+            with self.db.connect() as conn:
+                # Prefer a cursor whose identity currently names a registered
+                # archive (the file that was just rotated away under its still
+                # open handle); only then fall back to the most recently
+                # updated live cursor.  This keeps reclaim aimed at the
+                # original file of the in-flight collection rather than at an
+                # empty successor file the writer may already have created.
+                row = conn.execute(
+                    """SELECT c.file_key
+                         FROM cursors c
+                         JOIN file_epochs e ON e.file_key = c.file_key
+                         JOIN archived_files a
+                           ON a.device = e.device AND a.inode = e.inode
+                        WHERE c.source_id = ? AND e.status = 'live'
+                          AND a.status != 'deleted'
+                        ORDER BY c.updated_at DESC LIMIT 1""",
+                    (self.settings.source_id,),
+                ).fetchone()
+                if row is None:
+                    row = conn.execute(
+                        """SELECT c.file_key
+                             FROM cursors c
+                             JOIN file_epochs e ON e.file_key = c.file_key
+                            WHERE c.source_id = ? AND e.status = 'live'
+                            ORDER BY c.updated_at DESC LIMIT 1""",
+                        (self.settings.source_id,),
+                    ).fetchone()
+            if row is None:
+                return {
+                    "requested": True,
+                    "performed": False,
+                    "supported": True,
+                    "reason": "no cursor exists for this source yet",
+                    "file_key": None,
+                    "path": None,
+                }
+            file_key = str(row["file_key"])
+            expected_identity = IdentityRegistry.make_key_parts(file_key)
+
+        candidates = [self.settings.active_path]
+        if expected_identity is not None:
+            device, inode = expected_identity
+            with self.db.connect() as conn:
+                archive_rows = conn.execute(
+                    "SELECT path FROM archived_files WHERE device = ? AND inode = ?",
+                    (device, inode),
+                ).fetchall()
+            candidates.extend(Path(r["path"]) for r in archive_rows)
+        return self.reclaimer.reclaim_file(
+            file_key=file_key,
+            candidate_paths=candidates,
+            expected_identity=expected_identity,
+        ).as_dict()
 
     # --------------------------------------------------------------- drain
 
@@ -593,3 +688,36 @@ class RotationService:
         with self.db.connect() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
+
+    def reclaim_status(self) -> list[dict]:
+        """Persisted hole-punch progress for every known file cursor."""
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """SELECT c.file_key, c.source_id, c.path,
+                          c.offset_bytes AS committed_offset,
+                          c.punched_bytes, c.punch_supported,
+                          c.punch_last_error, c.updated_at,
+                          e.device, e.inode, e.epoch, e.status AS epoch_status
+                     FROM cursors c
+                     LEFT JOIN file_epochs e ON e.file_key = c.file_key
+                    ORDER BY c.updated_at DESC"""
+            ).fetchall()
+        items = [dict(r) for r in rows]
+        for item in items:
+            path = Path(item["path"]) if item.get("path") else None
+            item["file_exists"] = bool(path and path.exists())
+            if path and path.exists():
+                try:
+                    st = path.stat()
+                    item["file_size"] = st.st_size
+                    item["disk_blocks"] = st.st_blocks
+                    item["disk_bytes"] = st.st_blocks * 512
+                except OSError:  # pragma: no cover - racy unlink
+                    item["file_size"] = None
+                    item["disk_blocks"] = None
+                    item["disk_bytes"] = None
+            else:
+                item["file_size"] = None
+                item["disk_blocks"] = None
+                item["disk_bytes"] = None
+        return items

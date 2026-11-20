@@ -28,6 +28,8 @@ def main() -> int:
         show("1. append 3 lines through the active handle",
              writer.post("/writer/write-batch", json={"count": 3, "prefix": "before"}).json())
         show("2. collect them", api.post("/collect").json())
+        show("2b. collect again with reclaim (no new logs; block release is best-effort)",
+             api.post("/collect", params={"reclaim": "true"}).json().get("reclaim"))
 
         rotation = api.post("/rotation/rotate").json()
         show("3. rotate (rename only; old handle stays open)", rotation)

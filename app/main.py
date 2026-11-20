@@ -57,14 +57,32 @@ app.include_router(build_router(lambda: service))
 
 
 @app.post("/collect", tags=["collection"], summary="Collect newly appended lines")
-def collect() -> dict:
+def collect(
+    reclaim: bool = Query(
+        default=False,
+        description=(
+            "After ingestion, release filesystem blocks of the bytes already "
+            "committed to SQLite by hole punching (FALLOC_FL_PUNCH_HOLE). "
+            "File length and byte offsets are unchanged; the writer keeps "
+            "appending through its original handle. Only blocks fully before "
+            "the committed cursor of this collection's original file are "
+            "released. Safe to repeat: a call with no new logs still catches "
+            "up on previously unreleased blocks."
+        ),
+    ),
+) -> dict:
     """Read lines appended to the active log since the last collected offset.
 
     Safe to call repeatedly and safe after a restart: the committed cursor and
     the unique ``(file_key, byte_offset)`` key make re-reads idempotent.
+
+    With ``reclaim=true`` the response carries a ``reclaim`` section describing
+    the hole-punch attempt. Reclamation is best-effort: if it fails the error
+    is reported there (and persisted on the cursor), while all ingested records
+    remain available from ``GET /entries``.
     """
     try:
-        return service.collect_active()
+        return service.collect_active(reclaim=reclaim)
     except WorkflowError as exc:
         raise _handle_error(exc) from exc
 
@@ -208,6 +226,16 @@ def entries(
         "next_after_id": rows[-1]["id"] if rows else after_id,
         "items": rows,
     }
+
+
+@app.get(
+    "/reclaim",
+    tags=["inspection"],
+    summary="Persisted hole-punch progress per file cursor",
+)
+def reclaim_status() -> dict:
+    rows = service.reclaim_status()
+    return {"count": len(rows), "items": rows}
 
 
 @app.get("/health", tags=["inspection"])
