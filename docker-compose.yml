@@ -1,0 +1,67 @@
+services:
+  writer:
+    build: .
+    image: log-rotation-demo:latest
+    command:
+      - uvicorn
+      - writer_service.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8001"
+    environment:
+      LOG_ACTIVE_PATH: /logs/access.log
+      LOG_ARCHIVE_DIR: /logs/archive
+    volumes:
+      - logs:/logs
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3)"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  collector:
+    build: .
+    image: log-rotation-demo:latest
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    environment:
+      LOG_ACTIVE_PATH: /logs/access.log
+      LOG_ARCHIVE_DIR: /logs/archive
+      LOG_DB_PATH: /data/collector.sqlite3
+      LOG_SOURCE_ID: access
+      WRITER_BASE_URL: http://writer:8001
+    volumes:
+      - logs:/logs
+      - collector-data:/data
+    ports:
+      - "8000:8000"
+    depends_on:
+      writer:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  logs:
+  collector-data:
